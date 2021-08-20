@@ -1,2 +1,4 @@
 FROM ubuntu
-RUN echo world > hello.txt
+COPY --from=bitnami/kubectl /opt/bitnami/kubectl/bin/kubectl /usr/local/bin
+COPY entrypoint /usr/local/bin/entrypoint
+ENTRYPOINT ["/usr/local/bin/entrypoint"]
