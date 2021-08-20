@@ -8,8 +8,8 @@ jobs:
       fail-fast: false
       matrix:
         dockerfile:
-          - [gitops, gitops/Dockerfile, 'linux/amd64,linux/arm64']
-            # TAG    DOCKERFILE  ARCHITECTURES
+          - [gitops, gitops,  'linux/amd64,linux/arm64']
+            # TAG    CONTEXT  ARCHITECTURES
 
     name: Build ${{ matrix.dockerfile[0] }}
     steps:
@@ -26,8 +26,8 @@ jobs:
         run: |
           printf "Preparing to build ${{ env.container }} from"\
                  "${{ matrix.dockerfile[1] }}"
-          if [ ! -f "${{ matrix.dockerfile[1]}}" ]; then
-              printf "Dockerfile ${{ matrix.dockerfile[0]}} does not exist"
+          if [ ! -f "${{ matrix.dockerfile[1] }}/Dockerfile" ]; then
+              printf "Dockerfile for ${{ matrix.dockerfile[0] }} does not exist"
               exit 1;
           fi
 
@@ -44,10 +44,10 @@ jobs:
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@v1
 
-      - name: Build & Deploy ${{ matrix.dockerfile[1] }}
+      - name: Build & Deploy ${{ matrix.dockerfile[0] }}
         uses: docker/build-push-action@v2
         with:
-          file: ${{matrix.dockerfile[1]}}
+          context: ${{matrix.dockerfile[1]}}
           platforms: ${{ matrix.dockerfile[2] }}
           push: true
           tags: |
