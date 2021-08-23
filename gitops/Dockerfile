@@ -8,6 +8,7 @@ RUN apt-get -yqq update \
  && apt-get -yqq install --no-install-recommends \
         git \
         locales \
+        openssh-client \
         python3 \
         python3-pip \
         python3-setuptools \
