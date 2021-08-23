@@ -20,4 +20,4 @@ ENV LANGUAGE en_US.UTF-8
 ENV LANG en_US.UTF-8
 ENV LC_ALL en_US.UTF-8
 
-ENTRYPOINT ["python", "/entrypoint.py"]
+ENTRYPOINT ["python3", "/entrypoint.py"]
