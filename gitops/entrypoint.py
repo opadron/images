@@ -292,11 +292,17 @@ while True:
         stage_dir = os.path.join(repo_dir, local_stage_slug)
 
         if os.path.isdir(prod_dir):
-            git('-C', repo_dir, 'rm', '-rf', local_prod_slug)
+            try:
+                git('-C', repo_dir, 'rm', '-rf', local_prod_slug)
+            except subprocess.CalledProcessError:
+                pass
         os.makedirs(prod_dir)
 
         if os.path.isdir(stage_dir):
-            git('-C', repo_dir, 'rm', '-rf', local_stage_slug)
+            try:
+                git('-C', repo_dir, 'rm', '-rf', local_stage_slug)
+            except subprocess.CalledProcessError:
+                pass
         os.makedirs(stage_dir)
 
         # main production section
