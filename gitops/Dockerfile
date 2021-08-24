@@ -1,6 +1,4 @@
 FROM ubuntu
-COPY --from=bitnami/kubectl /opt/bitnami/kubectl/bin/kubectl /usr/local/bin
-COPY entrypoint.py /entrypoint.py
 
 ENV DEBIAN_FRONTEND=noninteractive
 
@@ -20,5 +18,8 @@ RUN apt-get -yqq update \
 ENV LANGUAGE en_US.UTF-8
 ENV LANG en_US.UTF-8
 ENV LC_ALL en_US.UTF-8
+
+COPY --from=bitnami/kubectl /opt/bitnami/kubectl/bin/kubectl /usr/local/bin
+COPY entrypoint.py /entrypoint.py
 
 ENTRYPOINT ["python3", "/entrypoint.py"]
