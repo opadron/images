@@ -4,6 +4,7 @@ import datetime
 import os
 import os.path
 import subprocess
+import shutil
 import sys
 import time
 import yaml
@@ -295,14 +296,14 @@ while True:
             try:
                 git('-C', repo_dir, 'rm', '-rf', local_prod_slug)
             except subprocess.CalledProcessError:
-                pass
+                shutil.rmtree(prod_dir)
         os.makedirs(prod_dir)
 
         if os.path.isdir(stage_dir):
             try:
                 git('-C', repo_dir, 'rm', '-rf', local_stage_slug)
             except subprocess.CalledProcessError:
-                pass
+                shutil.rmtree(stage_dir)
         os.makedirs(stage_dir)
 
         # main production section
