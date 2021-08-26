@@ -11,18 +11,37 @@ import yaml
 
 parser = argparse.ArgumentParser()
 parser.add_argument('--repo', help='repo to monitor', required=True)
-parser.add_argument('--pre-branch', help='pre branch', required=True)
-parser.add_argument('--post-branch', help='post branch', required=True)
-parser.add_argument('--interval', help='polling interval', type=int, default=300)
-parser.add_argument('--deploy-key', help='path to deployment key', required=True)
+
+parser.add_argument('--staging-branch',
+                    help='staging branch',
+                    required=True)
+parser.add_argument('--staging-dir',
+                    help=('directory from which to source '
+                          'manifests on the staging branch'),
+                    required=True)
+
+parser.add_argument('--production-branch',
+                    help='production branch',
+                    required=True)
+parser.add_argument('--production-dir',
+                    help=('directory from which to source '
+                          'manifests on the production branch'),
+                    required=True)
+
+parser.add_argument('--target-branch', help='target branch', required=True)
+parser.add_argument('--target-dir',
+                    help=('directory in which to store generated '
+                          'manifests on the target branch')
+                    , required=True)
+
+parser.add_argument('--interval',
+                    help='polling interval',
+                    type=int, default=300)
+parser.add_argument('--deploy-key',
+                    help='path to deployment key',
+                    required=True)
 parser.add_argument('--user-email', help='email to commit as', required=True)
 parser.add_argument('--user-name', help='user name to commit as', required=True)
-parser.add_argument('--source-dir',
-                    help='directory from which to source manifests',
-                    required=True)
-parser.add_argument('--destination-dir',
-                    help='directory to which to push generated manifests',
-                    required=True)
 parser.add_argument('--storage-dir',
                     help='directory to use for persistent storage',
                     required=True)
@@ -32,7 +51,7 @@ args = parser.parse_args()
 entries_map = {}
 special_map = {}
 class ParsedEntry:
-    def __init__(self, obj, update=True):
+    def __init__(self, obj, env, update=True):
         global entries_map
         global special_map
 
@@ -72,15 +91,15 @@ class ParsedEntry:
 
         key = (api_group, api_version, kind, namespace, name)
         if update:
-            entries_map[key] = self
+            entries_map[env][key] = self
 
         is_special = (kind == 'ConfigMap' and annotations)
         if is_special:
-            dr = annotations.get('cd.spack.io/derive-resource', False).lower()
+            dr = annotations.get('cd.spack.io/derive-resource', 'false').lower()
             is_special = (dr not in ('false', '0', 'off', 'no', 'disabled'))
 
         if is_special and update:
-            special_map[key] = self
+            special_map[env][key] = self
 
 
 def log(*args):
@@ -162,7 +181,7 @@ def write_scalar_to_path(f, val):
         fid.buffer.write(val)
 
 
-def iter_manifests(path):
+def iter_manifests(path, env):
     for prefix, _, files in os.walk(path):
         for filename in files:
             is_manifest = (filename.endswith('.yaml') or
@@ -174,7 +193,7 @@ def iter_manifests(path):
 
             with open(os.path.join(prefix, filename)) as f:
                 for obj in yaml.full_load_all(f):
-                    yield ParsedEntry(obj)
+                    yield ParsedEntry(obj, env)
 
 
 def process_patch(patch, env):
@@ -212,14 +231,38 @@ def git(*args, **kwargs):
 
 
 repo_dir = os.path.join(args.storage_dir, 'repo')
-last_pre_file = os.path.join(args.storage_dir, 'last-pre')
-last_post_file = os.path.join(args.storage_dir, 'last-post')
+def gitC(*args, **kwargs):
+    return git('-C', repo_dir, *args, **kwargs)
+
+
+def rev_list(branch):
+    return gitC('rev-list', '-n', '1', f'origin/{branch}', capture=True).strip()
+
+
+def hard_sync(branch):
+    gitC('checkout', branch)
+    gitC('reset', '--hard', f'origin/{branch}')
+
+
+def clear_git_dir(rel_path):
+    path = os.path.join(repo_dir, rel_path)
+    if os.path.isdir(path):
+        try:
+            gitC('rm', '-rf', rel_path)
+        except subprocess.CalledProcessError:
+            shutil.rmtree(path)
+    os.makedirs(path)
+
+last_staging_file = os.path.join(args.storage_dir, 'last-staging')
+last_production_file = os.path.join(args.storage_dir, 'last-production')
+last_target_file = os.path.join(args.storage_dir, 'last-target')
 
 git('config', '--global', 'user.name', args.user_name)
 git('config', '--global', 'user.email', args.user_email)
 
-last_pre_hash = read_scalar_from_path(last_pre_file)
-last_post_hash = read_scalar_from_path(last_post_file)
+last_staging_hash = read_scalar_from_path(last_staging_file)
+last_production_hash = read_scalar_from_path(last_production_file)
+last_target_hash = read_scalar_from_path(last_target_file)
 
 waited_last_iter = False
 
@@ -228,11 +271,12 @@ while True:
 
     # if repo exists, fetch
     if os.path.exists(repo_dir):
-        git('-C', repo_dir,
-            'fetch', 'origin',
-            args.pre_branch, args.post_branch,
-            stdout=subprocess.DEVNULL,
-            stderr=subprocess.DEVNULL)
+        gitC('fetch', 'origin',
+             args.staging_branch,
+             args.production_branch,
+             args.target_branch,
+             stdout=subprocess.DEVNULL,
+             stderr=subprocess.DEVNULL)
 
     # if the repo is not yet cloned, clone it
     else:
@@ -240,74 +284,76 @@ while True:
         os.makedirs(repo_dir)
         git('clone', args.repo, repo_dir)
 
-    current_pre_hash = git('-C', repo_dir, 'rev-list', '-n', '1',
-                             f'origin/{args.pre_branch}', capture=True).strip()
-    current_post_hash = git('-C', repo_dir, 'rev-list', '-n', '1',
-                            f'origin/{args.post_branch}', capture=True).strip()
+    current_staging_hash = rev_list(args.staging_branch)
+    current_production_hash = rev_list(args.production_branch)
+    current_target_hash = rev_list(args.target_branch)
 
-    pre_up_to_date = (last_pre_hash is not None and
-                      last_pre_hash == current_pre_hash)
+    staging_up_to_date = (last_staging_hash is not None and
+                          last_staging_hash == current_staging_hash)
+    production_up_to_date = (last_production_hash is not None and
+                             last_production_hash == current_production_hash)
+    target_up_to_date = (last_target_hash is not None and
+                         last_target_hash == current_target_hash)
 
-    post_up_to_date = (last_post_hash is not None and
-                      last_post_hash == current_post_hash)
+    update_staging = False
+    update_production = False
+    update_target = False
 
-    update_pre = False
-    update_post = False
+    all_up_to_date = (staging_up_to_date and
+                      production_up_to_date and
+                      target_up_to_date)
 
-    if pre_up_to_date and post_up_to_date and not waited_last_iter:
+    if all_up_to_date and not waited_last_iter:
         log('waiting for updates')
         waited_last_iter = True
 
-    if not post_up_to_date:
+    if not target_up_to_date:
         waited_last_iter = False
-        log('syncing downstream branch')
-        git('-C', repo_dir, 'checkout', args.post_branch)
-        git('-C', repo_dir, 'reset', '--hard', f'origin/{args.post_branch}')
-        update_post = True
+        log('syncing target branch')
+        hard_sync(args.target_branch)
+        update_target = True
 
-    if not pre_up_to_date:
+    if not production_up_to_date:
         waited_last_iter = False
-        log('syncing upstream branch')
-        git('-C', repo_dir, 'checkout', args.pre_branch)
-        git('-C', repo_dir, 'reset', '--hard', f'origin/{args.pre_branch}')
-
-        entries_map = {}
-        special_map = {}
-
-        log('processing base manifests')
-        for entry in iter_manifests(os.path.join(repo_dir, args.source_dir)):
+        log('syncing production branch')
+        hard_sync(args.production_branch)
+        entries_map['production'] = {}
+        special_map['production'] = {}
+        log('processing production manifests')
+        manifests = iter_manifests(os.path.join(repo_dir, args.production_dir),
+                                   'production')
+        for entry in manifests:
             pass
         print('(done)')
 
-        log('checking out downstream branch')
-        git('-C', repo_dir, 'checkout', args.post_branch)
-        git('-C', repo_dir, 'reset', '--hard', f'origin/{args.post_branch}')
+    if not staging_up_to_date:
+        waited_last_iter = False
+        log('syncing staging branch')
+        hard_sync(args.staging_branch)
+        entries_map['staging'] = {}
+        special_map['staging'] = {}
 
+        log('processing staging manifests')
+        manifests = iter_manifests(os.path.join(repo_dir, args.staging_dir),
+                                   'staging')
+        for entry in manifests:
+            pass
+        print('(done)')
+
+    if not (production_up_to_date and staging_up_to_date):
+        log('checking out target branch')
+        hard_sync(args.target_branch)
         log('generating manifests')
 
         # initial house keeping
-        local_prod_slug = os.path.join(args.destination_dir, 'production')
-        prod_dir = os.path.join(repo_dir, local_prod_slug)
+        local_prod_dir = os.path.join(args.target_dir, 'production')
+        local_stage_dir = os.path.join(args.target_dir, 'staging')
 
-        local_stage_slug = os.path.join(args.destination_dir, 'staging')
-        stage_dir = os.path.join(repo_dir, local_stage_slug)
-
-        if os.path.isdir(prod_dir):
-            try:
-                git('-C', repo_dir, 'rm', '-rf', local_prod_slug)
-            except subprocess.CalledProcessError:
-                shutil.rmtree(prod_dir)
-        os.makedirs(prod_dir)
-
-        if os.path.isdir(stage_dir):
-            try:
-                git('-C', repo_dir, 'rm', '-rf', local_stage_slug)
-            except subprocess.CalledProcessError:
-                shutil.rmtree(stage_dir)
-        os.makedirs(stage_dir)
+        clear_git_dir(local_prod_dir)
+        clear_git_dir(local_stage_dir)
 
         # main production section
-        for entry in entries_map.values():
+        for entry in entries_map['production'].values():
             if entry.ignored:
                 continue
 
@@ -319,20 +365,22 @@ while True:
                                       entry.name)),
                             'yaml'))
 
-            local_filepath = os.path.join(local_prod_slug, filename)
-            filepath = os.path.join(prod_dir, filename)
-
+            local_filepath = os.path.join(local_prod_dir, filename)
+            filepath = os.path.join(repo_dir, local_filepath)
             local_display_path = os.path.relpath(local_filepath,
-                                                 args.destination_dir)
+                                                 args.target_dir)
             print(f'  + {local_display_path}')
             with open(filepath, 'w') as f:
                 f.write('---\n')
                 yaml.dump(entry.obj, f)
+            gitC('add', local_filepath)
 
-            git('-C', repo_dir, 'add', local_filepath)
+        log('committing production update')
+        commit_msg = f'update from production: {current_production_hash}'
+        gitC('commit', '--allow-empty', '-m', commit_msg)
 
         # staging section
-        for entry in special_map.values():
+        for entry in special_map['staging'].values():
             if entry.ignored:
                 continue
 
@@ -343,13 +391,14 @@ while True:
             name = entry.obj['data']['name']
             namespace = entry.namespace
 
-            ref = entries_map[(api_group, api_version, kind, namespace, name)]
+            ref = entries_map['staging'][
+                    (api_group, api_version, kind, namespace, name)]
             patch = process_patch(yaml.full_load(entry.obj['data']['patch']),
                                   env='staging')
 
             new_obj = copy.deepcopy(ref.obj)
             apply_patch(new_obj, patch)
-            new_obj = ParsedEntry(new_obj, update=False)
+            new_obj = ParsedEntry(new_obj, 'staging', update=False)
 
             if new_obj.ignored:
                 continue
@@ -362,38 +411,41 @@ while True:
                                       new_obj.name)),
                             'yaml'))
 
-            local_filepath = os.path.join(local_stage_slug, filename)
-            filepath = os.path.join(stage_dir, filename)
-
+            local_filepath = os.path.join(local_stage_dir, filename)
+            filepath = os.path.join(repo_dir, local_filepath)
             local_display_path = os.path.relpath(local_filepath,
-                                                 args.destination_dir)
+                                                 args.target_dir)
             print(f'  + {local_display_path}')
             with open(filepath, 'w') as f:
                 f.write('---\n')
                 yaml.dump(new_obj.obj, f)
 
-            git('-C', repo_dir, 'add', local_filepath)
+            gitC('add', local_filepath)
 
-        log('committing & pushing')
-        commit_msg = f'update from ref: {current_pre_hash}'
-        git('-C', repo_dir, 'commit', '--allow-empty', '-m', commit_msg)
-        git('-C', repo_dir, 'push', 'origin',
-                ':'.join((args.post_branch, args.post_branch)))
+        log('committing staging update')
+        commit_msg = f'update from staging: {current_staging_hash}'
+        gitC('commit', '--allow-empty', '-m', commit_msg)
 
-        current_post_hash = git('-C', repo_dir, 'rev-list', '-n', '1',
-                                f'origin/{args.post_branch}',
-                                capture=True).strip()
+        log('pushing updates')
+        update_spec = ':'.join((args.target_branch, args.target_branch))
+        gitC('push', 'origin', update_spec)
 
-        update_pre = True
-        update_post = True
+        current_target_hash = rev_list(args.target_branch)
+        update_staging = True
+        update_production = True
+        update_target = True
 
-    if update_pre:
-        write_scalar_to_path(last_pre_file, current_pre_hash)
-        last_pre_hash = current_pre_hash
+    if update_staging:
+        write_scalar_to_path(last_staging_file, current_staging_hash)
+        last_staging_hash = current_staging_hash
 
-    if update_post:
-        write_scalar_to_path(last_post_file, current_post_hash)
-        last_post_hash = current_post_hash
+    if update_production:
+        write_scalar_to_path(last_production_file, current_production_hash)
+        last_production_hash = current_production_hash
+
+    if update_target:
+        write_scalar_to_path(last_target_file, current_target_hash)
+        last_target_hash = current_target_hash
 
     elapsed_time = time.time() - start_time
     sleep_time = args.interval - elapsed_time
