@@ -9,23 +9,21 @@ import sys
 import time
 import yaml
 
+import git
+
 parser = argparse.ArgumentParser()
 parser.add_argument('--repo', help='repo to monitor', required=True)
 
 parser.add_argument('--staging-branch',
                     help='staging branch',
                     required=True)
-parser.add_argument('--staging-dir',
+parser.add_argument('--source-dir',
                     help=('directory from which to source '
-                          'manifests on the staging branch'),
+                          'manifests on the production and staging branches'),
                     required=True)
 
 parser.add_argument('--production-branch',
                     help='production branch',
-                    required=True)
-parser.add_argument('--production-dir',
-                    help=('directory from which to source '
-                          'manifests on the production branch'),
                     required=True)
 
 parser.add_argument('--target-branch', help='target branch', required=True)
@@ -74,7 +72,7 @@ class ParsedEntry:
         namespace = metadata.get('namespace', 'default')
 
         annotations = metadata.get('annotations', None)
-        ignored = (annotations and annotations.get('fluxcd.io/ignore', False))
+        ignored = (annotations and annotations.get('cd.spack.io/ignore', False))
 
         tokens = api_version.split('/')
         api_group, api_version = (
@@ -95,7 +93,7 @@ class ParsedEntry:
 
         is_special = (kind == 'ConfigMap' and annotations)
         if is_special:
-            dr = annotations.get('cd.spack.io/derive-resource', 'false').lower()
+            dr = annotations.get('cd.spack.io/staged-resource', 'false').lower()
             is_special = (dr not in ('false', '0', 'off', 'no', 'disabled'))
 
         if is_special and update:
@@ -104,9 +102,18 @@ class ParsedEntry:
 
 def log(*args):
     sys.stdout.write('\n')
-    sys.stdout.write('\x1b[1;33m[')
+    sys.stdout.write('\x1b[1;34m[')
     sys.stdout.write(str(datetime.datetime.now()))
-    sys.stdout.write('] \x1b[1;34m')
+    sys.stdout.write('] \x1b[1;32m')
+    sys.stdout.write(*args)
+    sys.stdout.write('\x1b[0m\n')
+
+
+def warn(*args):
+    sys.stdout.write('\n')
+    sys.stdout.write('\x1b[1;34m[')
+    sys.stdout.write(str(datetime.datetime.now()))
+    sys.stdout.write('] \x1b[1;33m')
     sys.stdout.write(*args)
     sys.stdout.write('\x1b[0m\n')
 
@@ -181,7 +188,7 @@ def write_scalar_to_path(f, val):
         fid.buffer.write(val)
 
 
-def iter_manifests(path, env):
+def iter_manifests(path, repo, env):
     for prefix, _, files in os.walk(path):
         for filename in files:
             is_manifest = (filename.endswith('.yaml') or
@@ -191,9 +198,17 @@ def iter_manifests(path, env):
             if not is_manifest:
                 continue
 
-            with open(os.path.join(prefix, filename)) as f:
-                for obj in yaml.full_load_all(f):
-                    yield ParsedEntry(obj, env)
+            filepath = os.path.join(prefix, filename)
+            with open(filepath) as f:
+                try:
+                    for obj in yaml.full_load_all(f):
+                        yield ParsedEntry(obj, env)
+                except yaml.scanner.ScannerError as e:
+                    warn(f'file failed to parse')
+                    sys.stdout.write('\x1b[1;31m')
+                    e.problem_mark.name = repo.local(filepath)
+                    print(e)
+                    sys.stdout.write('\x1b[0m')
 
 
 def process_patch(patch, env):
@@ -210,55 +225,16 @@ def process_patch(patch, env):
     return patch
 
 
-key_file = os.path.abspath(args.deploy_key)
-git_env = {'GIT_SSH_COMMAND': ('ssh '
-                               '-o StrictHostKeyChecking=no '
-                               '-o UserKnownHostsFile=/dev/null '
-                               f'-i {key_file}')}
-def git(*args, **kwargs):
-    capture = kwargs.pop('capture', False)
-    new_env = {}
-    new_env.update(os.environ)
-    new_env.update(git_env)
-    new_env.update(kwargs.pop('env', {}))
-    kwargs['env'] = new_env
-
-    args = ['git'] + list(args)
-    if capture:
-        return subprocess.check_output(args, **kwargs).decode('UTF-8')
-
-    subprocess.check_call(args, **kwargs)
-
-
-repo_dir = os.path.join(args.storage_dir, 'repo')
-def gitC(*args, **kwargs):
-    return git('-C', repo_dir, *args, **kwargs)
-
-
-def rev_list(branch):
-    return gitC('rev-list', '-n', '1', f'origin/{branch}', capture=True).strip()
-
-
-def hard_sync(branch):
-    gitC('checkout', branch)
-    gitC('reset', '--hard', f'origin/{branch}')
-
-
-def clear_git_dir(rel_path):
-    path = os.path.join(repo_dir, rel_path)
-    if os.path.isdir(path):
-        try:
-            gitC('rm', '-rf', rel_path)
-        except subprocess.CalledProcessError:
-            shutil.rmtree(path)
-    os.makedirs(path)
+repo = git.Git(path=os.path.join(args.storage_dir, 'repo'),
+               repo=args.repo,
+               key_file=args.deploy_key)
 
 last_staging_file = os.path.join(args.storage_dir, 'last-staging')
 last_production_file = os.path.join(args.storage_dir, 'last-production')
 last_target_file = os.path.join(args.storage_dir, 'last-target')
 
-git('config', '--global', 'user.name', args.user_name)
-git('config', '--global', 'user.email', args.user_email)
+repo.global_config(('user.name', args.user_name),
+                   ('user.email', args.user_email))
 
 last_staging_hash = read_scalar_from_path(last_staging_file)
 last_production_hash = read_scalar_from_path(last_production_file)
@@ -269,90 +245,94 @@ waited_last_iter = False
 while True:
     start_time = time.time()
 
-    # if repo exists, fetch
-    if os.path.exists(repo_dir):
-        gitC('fetch', 'origin',
-             args.staging_branch,
-             args.production_branch,
-             args.target_branch,
-             stdout=subprocess.DEVNULL,
-             stderr=subprocess.DEVNULL)
+    repo.fetch(args.staging_branch,
+               args.production_branch,
+               args.target_branch)
 
-    # if the repo is not yet cloned, clone it
-    else:
-        log('Cloning Upstream')
-        os.makedirs(repo_dir)
-        git('clone', args.repo, repo_dir)
+    current_staging_hash = repo.rev_list(args.staging_branch)
+    current_production_hash = repo.rev_list(args.production_branch)
+    current_target_hash = repo.rev_list(args.target_branch)
 
-    current_staging_hash = rev_list(args.staging_branch)
-    current_production_hash = rev_list(args.production_branch)
-    current_target_hash = rev_list(args.target_branch)
+    staging_needs_update = (last_staging_hash is None or
+                            last_staging_hash != current_staging_hash)
 
-    staging_up_to_date = (last_staging_hash is not None and
-                          last_staging_hash == current_staging_hash)
-    production_up_to_date = (last_production_hash is not None and
-                             last_production_hash == current_production_hash)
-    target_up_to_date = (last_target_hash is not None and
-                         last_target_hash == current_target_hash)
+    production_needs_update = (last_production_hash is None or
+                            last_production_hash != current_production_hash)
 
-    update_staging = False
-    update_production = False
-    update_target = False
+    target_needs_update = (last_target_hash is None or
+                            last_target_hash != current_target_hash)
 
-    all_up_to_date = (staging_up_to_date and
-                      production_up_to_date and
-                      target_up_to_date)
+    update_staging_hash = False
+    update_production_hash = False
+    update_target_hash = False
+
+    all_up_to_date = not (staging_needs_update or
+                          production_needs_update or
+                          target_needs_update)
 
     if all_up_to_date and not waited_last_iter:
-        log('waiting for updates')
+        log('Waiting for Updates')
         waited_last_iter = True
 
-    if not target_up_to_date:
+    if target_needs_update:
         waited_last_iter = False
-        log('syncing target branch')
-        hard_sync(args.target_branch)
-        update_target = True
+        if current_target_hash != '-':
+            log('Syncing Target Branch')
+            repo.hard_sync(args.target_branch)
+        update_target_hash = True
 
-    if not production_up_to_date:
+    if production_needs_update:
         waited_last_iter = False
-        log('syncing production branch')
-        hard_sync(args.production_branch)
         entries_map['production'] = {}
         special_map['production'] = {}
-        log('processing production manifests')
-        manifests = iter_manifests(os.path.join(repo_dir, args.production_dir),
-                                   'production')
-        for entry in manifests:
-            pass
-        print('(done)')
 
-    if not staging_up_to_date:
+        if current_production_hash != '-':
+            log('Syncing Production Branch')
+            repo.hard_sync(args.production_branch)
+
+            log('Processing Production Manifests')
+            manifests = iter_manifests(
+                    os.path.join(repo.path, args.source_dir),
+                    repo,
+                    'production')
+            for entry in manifests:
+                pass
+            print('(done)')
+        update_production_hash = True
+
+    if staging_needs_update:
         waited_last_iter = False
-        log('syncing staging branch')
-        hard_sync(args.staging_branch)
         entries_map['staging'] = {}
         special_map['staging'] = {}
 
-        log('processing staging manifests')
-        manifests = iter_manifests(os.path.join(repo_dir, args.staging_dir),
-                                   'staging')
-        for entry in manifests:
-            pass
-        print('(done)')
+        if current_staging_hash != '-':
+            log('Syncing Staging Branch')
+            repo.hard_sync(args.staging_branch)
 
-    if not (production_up_to_date and staging_up_to_date):
-        log('checking out target branch')
-        hard_sync(args.target_branch)
-        log('generating manifests')
+            log('Processing Staging Manifests')
+            manifests = iter_manifests(os.path.join(repo.path, args.source_dir),
+                                       repo,
+                                       'staging')
+            for entry in manifests:
+                pass
+            print('(done)')
+        update_staging_hash = True
+
+    if production_needs_update or staging_needs_update:
+        log('Checking Out Target Branch')
+        if current_target_hash == '-':
+            repo('checkout', '-b', args.target_branch)
+        else:
+            repo.hard_sync(args.target_branch)
 
         # initial house keeping
-        local_prod_dir = os.path.join(args.target_dir, 'production')
-        local_stage_dir = os.path.join(args.target_dir, 'staging')
+        repo.clear_dir(os.path.join(repo.path, args.target_dir, 'production'))
+        repo.clear_dir(os.path.join(repo.path, args.target_dir, 'staging'))
 
-        clear_git_dir(local_prod_dir)
-        clear_git_dir(local_stage_dir)
+        log('Generating Production Manifests')
 
         # main production section
+        target_infix = 'production'
         for entry in entries_map['production'].values():
             if entry.ignored:
                 continue
@@ -365,21 +345,22 @@ while True:
                                       entry.name)),
                             'yaml'))
 
-            local_filepath = os.path.join(local_prod_dir, filename)
-            filepath = os.path.join(repo_dir, local_filepath)
-            local_display_path = os.path.relpath(local_filepath,
-                                                 args.target_dir)
-            print(f'  + {local_display_path}')
+            filepath = os.path.join(
+                    repo.path, args.target_dir, target_infix, filename)
+
+            print(f'  + {repo.local(filepath, infix=target_infix)}')
             with open(filepath, 'w') as f:
                 f.write('---\n')
                 yaml.dump(entry.obj, f)
-            gitC('add', local_filepath)
+            repo.add(filepath)
 
-        log('committing production update')
-        commit_msg = f'update from production: {current_production_hash}'
-        gitC('commit', '--allow-empty', '-m', commit_msg)
+        log('Committing Production Manifests')
+        repo.commit(f'update from production: {current_production_hash}')
+
+        log('Generating Staging Manifests')
 
         # staging section
+        target_infix = 'staging'
         for entry in special_map['staging'].values():
             if entry.ignored:
                 continue
@@ -391,10 +372,26 @@ while True:
             name = entry.obj['data']['name']
             namespace = entry.namespace
 
-            ref = entries_map['staging'][
-                    (api_group, api_version, kind, namespace, name)]
-            patch = process_patch(yaml.full_load(entry.obj['data']['patch']),
-                                  env='staging')
+            ref = entries_map['staging'].get(
+                    (api_group, api_version, kind, namespace, name), None)
+
+            if not ref:
+                resource = '-'.join((
+                    api_group, api_version, kind, namespace, name))
+                warn(f'referenced resource not found: {resource}')
+                continue
+
+            try:
+                patch = process_patch(
+                        yaml.full_load(entry.obj['data']['patch']),
+                        env='staging')
+            except yaml.scanner.ScannerError as e:
+                f_entry = '/'.join((entry.namespace, entry.name))
+                warn(f'failed to parse patch data: {f_entry}')
+                sys.stdout.write('\x1b[1;31m')
+                print(e)
+                sys.stdout.write('\x1b[0m')
+                continue
 
             new_obj = copy.deepcopy(ref.obj)
             apply_patch(new_obj, patch)
@@ -411,39 +408,36 @@ while True:
                                       new_obj.name)),
                             'yaml'))
 
-            local_filepath = os.path.join(local_stage_dir, filename)
-            filepath = os.path.join(repo_dir, local_filepath)
-            local_display_path = os.path.relpath(local_filepath,
-                                                 args.target_dir)
-            print(f'  + {local_display_path}')
+
+            filepath = os.path.join(
+                    repo.path, args.target_dir, target_infix, filename)
+
+            print(f'  + {repo.local(filepath, infix=target_infix)}')
             with open(filepath, 'w') as f:
                 f.write('---\n')
                 yaml.dump(new_obj.obj, f)
+            repo.add(filepath)
 
-            gitC('add', local_filepath)
+        log('Committing Staging Manifests')
+        repo.commit(f'update from staging: {current_staging_hash}')
 
-        log('committing staging update')
-        commit_msg = f'update from staging: {current_staging_hash}'
-        gitC('commit', '--allow-empty', '-m', commit_msg)
+        log('Pushing Updates')
+        repo.push(args.target_branch, args.target_branch)
 
-        log('pushing updates')
-        update_spec = ':'.join((args.target_branch, args.target_branch))
-        gitC('push', 'origin', update_spec)
+        current_target_hash = repo.rev_list(args.target_branch)
+        update_staging_hash = True
+        update_production_hash = True
+        update_target_hash = True
 
-        current_target_hash = rev_list(args.target_branch)
-        update_staging = True
-        update_production = True
-        update_target = True
-
-    if update_staging:
+    if update_staging_hash:
         write_scalar_to_path(last_staging_file, current_staging_hash)
         last_staging_hash = current_staging_hash
 
-    if update_production:
+    if update_production_hash:
         write_scalar_to_path(last_production_file, current_production_hash)
         last_production_hash = current_production_hash
 
-    if update_target:
+    if update_target_hash:
         write_scalar_to_path(last_target_file, current_target_hash)
         last_target_hash = current_target_hash
 

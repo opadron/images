@@ -21,5 +21,6 @@ ENV LC_ALL en_US.UTF-8
 
 COPY --from=bitnami/kubectl /opt/bitnami/kubectl/bin/kubectl /usr/local/bin
 COPY entrypoint.py /entrypoint.py
+COPY git.py /git.py
 
 ENTRYPOINT ["python3", "/entrypoint.py"]
